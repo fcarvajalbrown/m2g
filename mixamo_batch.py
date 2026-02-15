@@ -77,7 +77,9 @@ def parse_args(argv):
         "character": pop_flag("--character", None),
         "anims": pop_list("--anims"),
         "out": pop_flag("--out", "./output"),
-        "mode": pop_flag("--mode", "inplace").lower(),  # inplace | rootmotion
+        "mode": pop_flag("--mode", "rootmotion").lower(),  # inplace | rootmotion
+        "inplace_ground_lock": pop_bool("--inplace-ground-lock", True),
+        "inplace_anchor": pop_flag("--inplace-anchor", "hips").lower(),  # hips | foot
         "export_mesh_in_anims": pop_bool("--export-mesh-in-anims", False),
         "apply_scale": pop_bool("--apply-scale", True),
         "fix_root": pop_bool("--fix-root", True),
@@ -91,6 +93,8 @@ def parse_args(argv):
         raise ValueError("--anims requires at least one FBX animation path.")
     if args["mode"] not in ("inplace", "rootmotion"):
         raise ValueError("--mode must be 'inplace' or 'rootmotion'.")
+    if args["inplace_anchor"] not in ("hips", "foot"):
+        raise ValueError("--inplace-anchor must be 'hips' or 'foot'.")
 
     return args
 
@@ -353,6 +357,23 @@ def find_hips_bone_name(arm_obj):
     return None
 
 
+def find_foot_bone_names(arm_obj):
+    names = [b.name for b in arm_obj.data.bones]
+    exact = {"leftfoot", "rightfoot", "lefttoebase", "righttoebase"}
+    foots = []
+    for n in names:
+        ln = n.lower()
+        if ln in exact or ln.endswith("foot") or ln.endswith("toe") or ln.endswith("toebase"):
+            foots.append(n)
+    return foots
+
+
+def object_uniform_scale(obj):
+    s = obj.scale
+    vals = [abs(float(s.x)), abs(float(s.y)), abs(float(s.z))]
+    return sum(vals) / 3.0
+
+
 def iter_action_fcurves(action):
     """
     Yield fcurves from both legacy Action API (action.fcurves)
@@ -501,6 +522,11 @@ def bake_action_to_base(base_arm, src_arm, src_action, new_name):
     src_names = set(pb.name for pb in src_arm.pose.bones)
     base_names = set(pb.name for pb in base_arm.pose.bones)
     common = src_names.intersection(base_names)
+    src_obj_scale = object_uniform_scale(src_arm)
+    base_obj_scale = object_uniform_scale(base_arm)
+    location_scale_factor = 1.0
+    if base_obj_scale > 1e-8:
+        location_scale_factor = src_obj_scale / base_obj_scale
 
     def bone_from_data_path(path):
         prefix = 'pose.bones["'
@@ -514,6 +540,7 @@ def bake_action_to_base(base_arm, src_arm, src_action, new_name):
 
     curves_copied = 0
     curves_skipped_non_bone = 0
+    location_curves_scaled = 0
     for src_fc in iter_action_fcurves(src_action):
         data_path = src_fc.data_path
         if not data_path.startswith('pose.bones["'):
@@ -548,7 +575,16 @@ def bake_action_to_base(base_arm, src_arm, src_action, new_name):
             dkp.period = kp.period
             dkp.handle_left_type = kp.handle_left_type
             dkp.handle_right_type = kp.handle_right_type
+
+            # Mixamo FBX imports often have animation armature at scale 0.01.
+            # Compensate location keys so copied action matches base armature scale.
+            if data_path.endswith('"].location') and abs(location_scale_factor - 1.0) > 1e-8:
+                dkp.co[1] *= location_scale_factor
+                dkp.handle_left[1] *= location_scale_factor
+                dkp.handle_right[1] *= location_scale_factor
         dst_fc.update()
+        if data_path.endswith('"].location') and abs(location_scale_factor - 1.0) > 1e-8:
+            location_curves_scaled += 1
         curves_copied += 1
 
     return dst, {
@@ -557,6 +593,10 @@ def bake_action_to_base(base_arm, src_arm, src_action, new_name):
         "bones_baked": len(common),
         "curves_copied": curves_copied,
         "curves_skipped_non_bone": curves_skipped_non_bone,
+        "src_obj_scale": src_obj_scale,
+        "base_obj_scale": base_obj_scale,
+        "location_scale_factor": location_scale_factor,
+        "location_curves_scaled": location_curves_scaled,
     }
 
 
@@ -569,12 +609,21 @@ def clear_nla_tracks(arm_obj):
         tracks.remove(tracks[0])
 
 
-def make_inplace_on_action(base_arm, action):
+def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
     """
-    Remove horizontal translation on hips location curves (X,Y).
-    Keep Z.
+    In-place strategy:
+    - Prefer removing global drift from Root and armature object curves.
+    - If absent, fallback to Hips drift removal so walk/run won't move in world.
+    - Optionally lock vertical baseline too (ground_lock).
     """
-    result = {"status": "skipped", "bone": None}
+    result = {
+        "status": "skipped",
+        "bone": None,
+        "strategy": "root_object_then_hips",
+        "ground_lock": bool(ground_lock),
+        "anchor": anchor,
+        "anchor_bone": None,
+    }
 
     if action is None:
         result["status"] = "no_action"
@@ -582,8 +631,6 @@ def make_inplace_on_action(base_arm, action):
 
     hips = find_hips_bone_name(base_arm) or "Hips"
     result["bone"] = hips
-    target = f'pose.bones["{hips}"].location'
-    fcurves = [fc for fc in iter_action_fcurves(action) if fc.data_path == target]
 
     def set_curve_constant(fc, value):
         changed_local = False
@@ -594,30 +641,253 @@ def make_inplace_on_action(base_arm, action):
         fc.update()
         return changed_local
 
+    def lock_axes(curves, axes, value=0.0):
+        changed_local = False
+        touched_local = False
+        for fc in curves:
+            if fc.array_index not in axes:
+                continue
+            touched_local = True
+            if set_curve_constant(fc, value):
+                changed_local = True
+        return touched_local, changed_local
+
+    def detrend_curve(fc):
+        pts = list(fc.keyframe_points)
+        if len(pts) < 2:
+            return False
+        t0 = float(pts[0].co[0])
+        t1 = float(pts[-1].co[0])
+        if abs(t1 - t0) <= 1e-8:
+            return False
+        v0 = float(pts[0].co[1])
+        v1 = float(pts[-1].co[1])
+        m = (v1 - v0) / (t1 - t0)
+        changed_local = False
+        for kp in pts:
+            t = float(kp.co[0])
+            trend = v0 + m * (t - t0)
+            if abs(trend) > 1e-8:
+                kp.co[1] -= trend
+                kp.handle_left[1] -= trend
+                kp.handle_right[1] -= trend
+                changed_local = True
+        fc.update()
+        return changed_local
+
+    def trend_line_values(fc):
+        pts = list(fc.keyframe_points)
+        if len(pts) < 2:
+            return None
+        t0 = float(pts[0].co[0])
+        t1 = float(pts[-1].co[0])
+        if abs(t1 - t0) <= 1e-8:
+            return None
+        v0 = float(pts[0].co[1])
+        v1 = float(pts[-1].co[1])
+        m = (v1 - v0) / (t1 - t0)
+        return t0, v0, m
+
+    def apply_trend_subtraction(target_fc, trend_params):
+        if trend_params is None:
+            return False
+        t0, v0, m = trend_params
+        changed_local = False
+        for kp in list(target_fc.keyframe_points):
+            t = float(kp.co[0])
+            trend = v0 + m * (t - t0)
+            if abs(trend) > 1e-8:
+                kp.co[1] -= trend
+                kp.handle_left[1] -= trend
+                kp.handle_right[1] -= trend
+                changed_local = True
+        target_fc.update()
+        return changed_local
+
+    def subtract_anchor_signal(target_fc, anchor_fcurves):
+        """
+        Subtract full anchor signal (not just linear trend) from target curve.
+        This is more robust for locomotion clips with non-linear trajectory.
+        """
+        if not anchor_fcurves:
+            return False
+        pts = list(target_fc.keyframe_points)
+        if not pts:
+            return False
+
+        def avg_eval(curves, t):
+            vals = [fc.evaluate(t) for fc in curves]
+            return sum(vals) / len(vals) if vals else 0.0
+
+        changed_local = False
+        for kp in pts:
+            t = float(kp.co[0])
+            hl_t = float(kp.handle_left[0])
+            hr_t = float(kp.handle_right[0])
+            a = avg_eval(anchor_fcurves, t)
+            a_l = avg_eval(anchor_fcurves, hl_t)
+            a_r = avg_eval(anchor_fcurves, hr_t)
+            if abs(a) > 1e-8 or abs(a_l) > 1e-8 or abs(a_r) > 1e-8:
+                kp.co[1] -= a
+                kp.handle_left[1] -= a_l
+                kp.handle_right[1] -= a_r
+                changed_local = True
+        target_fc.update()
+        return changed_local
+
+    def shift_curve_to_zero_start(fc):
+        pts = list(fc.keyframe_points)
+        if not pts:
+            return False
+        base = float(pts[0].co[1])
+        if abs(base) <= 1e-8:
+            return False
+        changed_local = False
+        for kp in pts:
+            kp.co[1] -= base
+            kp.handle_left[1] -= base
+            kp.handle_right[1] -= base
+            changed_local = True
+        fc.update()
+        return changed_local
+
+    def curve_end_start_delta(fc):
+        pts = list(fc.keyframe_points)
+        if len(pts) < 2:
+            return 0.0
+        return float(pts[-1].co[1] - pts[0].co[1])
+
+    def remove_residual_end_drift(fc):
+        # After main correction, remove only remaining end-to-start drift.
+        pts = list(fc.keyframe_points)
+        if len(pts) < 2:
+            return False
+        t0 = float(pts[0].co[0])
+        t1 = float(pts[-1].co[0])
+        if abs(t1 - t0) <= 1e-8:
+            return False
+        delta = float(pts[-1].co[1] - pts[0].co[1])
+        if abs(delta) <= 1e-8:
+            return False
+        changed_local = False
+        for kp in pts:
+            alpha = (float(kp.co[0]) - t0) / (t1 - t0)
+            corr = delta * alpha
+            kp.co[1] -= corr
+            kp.handle_left[1] -= corr
+            kp.handle_right[1] -= corr
+            changed_local = True
+        fc.update()
+        return changed_local
+
+    def combine_trends(trends):
+        # trends entries: (t0, v0, m)
+        if not trends:
+            return None
+        if len(trends) == 1:
+            return trends[0]
+        ms = []
+        bs = []
+        for t0, v0, m in trends:
+            ms.append(m)
+            bs.append(v0 - m * t0)
+        m_avg = sum(ms) / len(ms)
+        b_avg = sum(bs) / len(bs)
+        # Use t0=0 representation: value = b_avg + m_avg * t
+        return (0.0, b_avg, m_avg)
+
+    def location_curve_map(curves):
+        return {fc.array_index: fc for fc in curves}
+
     changed = False
+    touched = False
 
-    # Strict in-place: zero all Hips location channels to avoid world drift across rigs.
-    for fc in fcurves:
-        if set_curve_constant(fc, 0.0):
-            changed = True
-
-    # Some files animate Root or armature object instead of Hips.
+    # Root carries the intended global trajectory when present.
     root_target = 'pose.bones["Root"].location'
     root_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == root_target]
-    # Root should be fixed at origin for in-place clips.
-    for fc in root_curves:
-        if set_curve_constant(fc, 0.0):
-            changed = True
+    axes = (0, 1, 2) if ground_lock else (0, 1)
+    t_root, c_root = lock_axes(root_curves, axes, value=0.0)
+    touched = touched or t_root
+    changed = changed or c_root
 
     obj_target = "location"
     obj_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == obj_target]
-    # Object transform drift should never leak into clip export.
-    for fc in obj_curves:
-        if set_curve_constant(fc, 0.0):
-            changed = True
+    # Some imports place trajectory in armature object instead of Root.
+    t_obj, c_obj = lock_axes(obj_curves, axes, value=0.0)
+    touched = touched or t_obj
+    changed = changed or c_obj
 
-    if not fcurves and not changed:
-        result["status"] = "no_hips_location_curves"
+    hips_target = f'pose.bones["{hips}"].location'
+    hips_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == hips_target]
+    hips_by_axis = location_curve_map(hips_curves)
+    should_fallback = (not touched)
+    if not should_fallback and hips_curves:
+        # Even when Root/Object exists, fallback if Hips still has net XY drift.
+        d0 = abs(curve_end_start_delta(hips_by_axis.get(0))) if hips_by_axis.get(0) else 0.0
+        d1 = abs(curve_end_start_delta(hips_by_axis.get(1))) if hips_by_axis.get(1) else 0.0
+        if max(d0, d1) > 1e-6:
+            should_fallback = True
+
+    if should_fallback:
+        if not hips_curves:
+            result["status"] = "no_root_object_or_hips_location_curves"
+            return result
+
+        # Optional anchor by foot: use foot trend as reference and subtract it from Hips.
+        # If not available, fallback to Hips self-detrend.
+        anchor_trend_by_axis = {}
+        anchor_signal_by_axis = {}
+        if anchor == "foot":
+            foot_candidates = find_foot_bone_names(base_arm)
+            per_axis = {0: [], 1: []}
+            per_axis_signal = {0: [], 1: []}
+            used_bones = []
+            for bone_name in foot_candidates:
+                foot_target = f'pose.bones["{bone_name}"].location'
+                foot_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == foot_target]
+                foot_by_axis = location_curve_map(foot_curves)
+                used = False
+                for axis in (0, 1):
+                    fc = foot_by_axis.get(axis)
+                    if fc is None:
+                        continue
+                    tr = trend_line_values(fc)
+                    if tr is not None:
+                        per_axis[axis].append(tr)
+                        per_axis_signal[axis].append(fc)
+                        used = True
+                if used:
+                    used_bones.append(bone_name)
+
+            for axis in (0, 1):
+                anchor_trend_by_axis[axis] = combine_trends(per_axis[axis])
+                anchor_signal_by_axis[axis] = per_axis_signal[axis]
+            if used_bones:
+                result["anchor_bone"] = ",".join(used_bones[:4])
+
+        for axis in (0, 1):
+            hips_fc = hips_by_axis.get(axis)
+            if hips_fc is None:
+                continue
+            if anchor_signal_by_axis.get(axis):
+                if subtract_anchor_signal(hips_fc, anchor_signal_by_axis[axis]):
+                    changed = True
+            elif anchor_trend_by_axis.get(axis) is not None:
+                if apply_trend_subtraction(hips_fc, anchor_trend_by_axis[axis]):
+                    changed = True
+            else:
+                if detrend_curve(hips_fc):
+                    changed = True
+            # Enforce strict in-place without discarding anchor behavior.
+            if remove_residual_end_drift(hips_fc):
+                changed = True
+
+        if ground_lock and 2 in hips_by_axis:
+            # Keep smooth vertical motion and only normalize baseline.
+            if shift_curve_to_zero_start(hips_by_axis[2]):
+                changed = True
+
+        result["status"] = "applied_fallback" if changed else "already_inplace_fallback"
     else:
         result["status"] = "applied" if changed else "already_inplace"
     return result
@@ -671,6 +941,8 @@ def main():
             "character": character_path,
             "anims": [os.path.abspath(a) for a in args["anims"]],
             "mode": args["mode"],
+            "inplace_ground_lock": args["inplace_ground_lock"],
+            "inplace_anchor": args["inplace_anchor"],
             "export_mesh_in_anims": args["export_mesh_in_anims"],
             "apply_scale": args["apply_scale"],
             "fix_root": args["fix_root"],
@@ -787,7 +1059,12 @@ def main():
         entry["bake"] = bake_info
 
         if args["mode"] == "inplace":
-            entry["inplace"] = make_inplace_on_action(base_arm, dst_action)
+            entry["inplace"] = make_inplace_on_action(
+                base_arm,
+                dst_action,
+                ground_lock=args["inplace_ground_lock"],
+                anchor=args["inplace_anchor"],
+            )
         else:
             entry["inplace"] = {"status": "preserved_rootmotion"}
 

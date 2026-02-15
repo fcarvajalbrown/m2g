@@ -41,6 +41,7 @@ Executável Blender usado no projeto:
   --anims ./input/anims/idle.fbx ./input/anims/walking.fbx ./input/anims/running.fbx ./input/anims/punching.fbx \
   --out ./output \
   --mode inplace \
+  --inplace-ground-lock true \
   --export-mesh-in-anims false \
   --apply-scale true \
   --fix-root true \
@@ -54,8 +55,14 @@ Executável Blender usado no projeto:
 - `--anims <paths...>`: lista de FBXs de animação
 - `--out <dir>`: diretório de saída (default `./output`)
 - `--mode inplace|rootmotion`:
-  - `inplace`: remove deslocamento no mundo (Hips/Root/Object em `location = 0`)
-  - `rootmotion`: preserva deslocamento original
+  - `inplace`: remove deslocamento no mundo; usa Root/Object e, se não houver curvas, fallback no Hips
+  - `rootmotion`: preserva deslocamento original (default quando `--mode` não é informado)
+- `--inplace-ground-lock true|false`:
+  - `true` (default): trava também eixo vertical do Root/Object (baseline de chão estável entre clips)
+  - `false`: remove apenas deslocamento horizontal global
+- `--inplace-anchor hips|foot`:
+  - `hips` (default): fallback de in-place usa tendência do Hips
+  - `foot`: fallback tenta usar tendência de um bone de pé como referência (aplicando correção no Hips)
 - `--export-mesh-in-anims true|false`: inclui mesh nos GLBs de animação (default `false`)
 - `--apply-scale true|false`: aplica transform para estabilidade (default `true`)
 - `--fix-root true|false`: cria bone `Root` acima de `Hips` quando ausente (default `true`)
@@ -73,7 +80,7 @@ Executável Blender usado no projeto:
    - normaliza nomes de bone
    - valida compatibilidade por conjunto de bones (`common_ratio >= 0.98`)
    - copia F-Curves de pose para uma nova Action no rig base (compatível com API legada e slotted do Blender 5)
-   - aplica `inplace` ou preserva root motion
+   - aplica `inplace` baseado em Root/Object (preservando Hips) ou preserva root motion
    - exporta GLB com exatamente 1 clip (`export_animation_mode=ACTIVE_ACTIONS`)
 
 ## Estrutura esperada
@@ -131,7 +138,7 @@ Em cada item de `anims`:
   - Corrigido no pipeline atual com `ACTIVE_ACTIONS` + limpeza de actions temporárias.
 
 - Esqueleto deslocando no mundo em `inplace`
-  - No estado atual, `inplace` é estrito e zera `location` de Hips/Root/Object para evitar drift.
+  - No estado atual, `inplace` atua em Root/Object (não no Hips) para evitar drift sem quebrar crouch.
   - Use `--mode rootmotion` se quiser preservar deslocamento.
 
 - Animação incompatível / distorcida
