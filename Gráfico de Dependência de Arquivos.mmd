@@ -1,0 +1,27 @@
+graph LR
+    subgraph Ambiente_Maya [Ambiente Maya]
+        User[Usuário do Maya] -->|Carrega Plugin| Init["__init__.py"]
+    end
+
+    subgraph Camada_Interface [Camada de Interface]
+        Init --> UI["ui.py (A Interface)"]
+        UI -->|Chama| Core["core.py (O Orquestrador)"]
+    end
+
+    subgraph Camada_Logica [Camada de Lógica]
+        Core -->|Usa| Utils["maya_utils.py (Wrappers da API)"]
+        Core -->|Formata| GLTF["gltf.py (Construtor JSON)"]
+        
+        %% Recursos Compartilhados
+        Core -.-> Const["constants.py"]
+        GLTF -.-> Const["constants.py"]
+        UI -.-> Const["constants.py"]
+    end
+
+    subgraph API_Interna [API Interna do Maya]
+        Utils -->|cmds.ls / cmds.getAttr| MayaCmds["maya.cmds"]
+        Utils -->|cmds.exportSelected| Export["Motor de Exportação"]
+    end
+
+    style Camada_Logica fill:#f0f7ff,stroke:#005cc5
+    style Camada_Interface fill:#fff7e6,stroke:#d48806 Code"
