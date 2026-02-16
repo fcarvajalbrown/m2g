@@ -368,6 +368,24 @@ def find_foot_bone_names(arm_obj):
     return foots
 
 
+def classify_bone_location_axes(arm_data_bone):
+    """
+    Determine which bone-local location axes map to world horizontal (XY)
+    vs vertical (Z), based on the bone's rest orientation.
+    Returns (horizontal_axes: list[int], vertical_axis: int).
+    """
+    mat = arm_data_bone.matrix_local
+    best_vert = 1  # default: bone-local Y (common for upward-pointing bones)
+    best_dot = 0.0
+    for i in range(3):
+        wz = abs(float(mat[2][i]))
+        if wz > best_dot:
+            best_dot = wz
+            best_vert = i
+    horizontal = sorted(i for i in range(3) if i != best_vert)
+    return horizontal, best_vert
+
+
 def object_uniform_scale(obj):
     s = obj.scale
     vals = [abs(float(s.x)), abs(float(s.y)), abs(float(s.z))]
@@ -609,6 +627,53 @@ def clear_nla_tracks(arm_obj):
         tracks.remove(tracks[0])
 
 
+def evaluate_foot_ground_z(base_arm, action, foot_bone_names):
+    """
+    Evaluate foot bones in world space via depsgraph to find the ground level.
+    Returns the minimum Z found across sampled frames, or None on failure.
+    """
+    if not foot_bone_names:
+        return None
+
+    ad = base_arm.animation_data
+    if ad is None:
+        return None
+
+    prev_action = ad.action
+    ad.action = action
+
+    scene = bpy.context.scene
+    frame_start = int(round(action.frame_range[0]))
+    frame_end = int(round(action.frame_range[1]))
+    if frame_end <= frame_start:
+        ad.action = prev_action
+        return None
+
+    n_samples = min(20, frame_end - frame_start + 1)
+    step = max(1, (frame_end - frame_start) / max(1, n_samples - 1))
+
+    min_z = None
+    try:
+        for i in range(n_samples):
+            f = frame_start + int(round(i * step))
+            f = min(f, frame_end)
+            scene.frame_set(f)
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            eval_arm = base_arm.evaluated_get(depsgraph)
+            for bn in foot_bone_names:
+                pb = eval_arm.pose.bones.get(bn)
+                if pb is None:
+                    continue
+                world_z = (eval_arm.matrix_world @ pb.head).z
+                if min_z is None or world_z < min_z:
+                    min_z = world_z
+    except Exception:
+        pass
+
+    ad.action = prev_action
+    return min_z
+
+
 def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
     """
     In-place strategy:
@@ -675,66 +740,6 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
         fc.update()
         return changed_local
 
-    def trend_line_values(fc):
-        pts = list(fc.keyframe_points)
-        if len(pts) < 2:
-            return None
-        t0 = float(pts[0].co[0])
-        t1 = float(pts[-1].co[0])
-        if abs(t1 - t0) <= 1e-8:
-            return None
-        v0 = float(pts[0].co[1])
-        v1 = float(pts[-1].co[1])
-        m = (v1 - v0) / (t1 - t0)
-        return t0, v0, m
-
-    def apply_trend_subtraction(target_fc, trend_params):
-        if trend_params is None:
-            return False
-        t0, v0, m = trend_params
-        changed_local = False
-        for kp in list(target_fc.keyframe_points):
-            t = float(kp.co[0])
-            trend = v0 + m * (t - t0)
-            if abs(trend) > 1e-8:
-                kp.co[1] -= trend
-                kp.handle_left[1] -= trend
-                kp.handle_right[1] -= trend
-                changed_local = True
-        target_fc.update()
-        return changed_local
-
-    def subtract_anchor_signal(target_fc, anchor_fcurves):
-        """
-        Subtract full anchor signal (not just linear trend) from target curve.
-        This is more robust for locomotion clips with non-linear trajectory.
-        """
-        if not anchor_fcurves:
-            return False
-        pts = list(target_fc.keyframe_points)
-        if not pts:
-            return False
-
-        def avg_eval(curves, t):
-            vals = [fc.evaluate(t) for fc in curves]
-            return sum(vals) / len(vals) if vals else 0.0
-
-        changed_local = False
-        for kp in pts:
-            t = float(kp.co[0])
-            hl_t = float(kp.handle_left[0])
-            hr_t = float(kp.handle_right[0])
-            a = avg_eval(anchor_fcurves, t)
-            a_l = avg_eval(anchor_fcurves, hl_t)
-            a_r = avg_eval(anchor_fcurves, hr_t)
-            if abs(a) > 1e-8 or abs(a_l) > 1e-8 or abs(a_r) > 1e-8:
-                kp.co[1] -= a
-                kp.handle_left[1] -= a_l
-                kp.handle_right[1] -= a_r
-                changed_local = True
-        target_fc.update()
-        return changed_local
-
     def shift_curve_to_zero_start(fc):
         pts = list(fc.keyframe_points)
         if not pts:
@@ -750,6 +755,16 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
             changed_local = True
         fc.update()
         return changed_local
+
+    def shift_curve_by(fc, offset):
+        if abs(offset) <= 1e-8:
+            return False
+        for kp in fc.keyframe_points:
+            kp.co[1] += offset
+            kp.handle_left[1] += offset
+            kp.handle_right[1] += offset
+        fc.update()
+        return True
 
     def curve_end_start_delta(fc):
         pts = list(fc.keyframe_points)
@@ -780,24 +795,24 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
         fc.update()
         return changed_local
 
-    def combine_trends(trends):
-        # trends entries: (t0, v0, m)
-        if not trends:
-            return None
-        if len(trends) == 1:
-            return trends[0]
-        ms = []
-        bs = []
-        for t0, v0, m in trends:
-            ms.append(m)
-            bs.append(v0 - m * t0)
-        m_avg = sum(ms) / len(ms)
-        b_avg = sum(bs) / len(bs)
-        # Use t0=0 representation: value = b_avg + m_avg * t
-        return (0.0, b_avg, m_avg)
-
     def location_curve_map(curves):
         return {fc.array_index: fc for fc in curves}
+
+    # Determine bone-local axis mapping for both Root and Hips.
+    # Mixamo bones point upward, so bone-local Y is world Z (vertical),
+    # while bone-local X and Z map to world X/Y (horizontal).
+    hips_bone = base_arm.data.bones.get(hips)
+    if hips_bone:
+        hips_horiz, hips_vert = classify_bone_location_axes(hips_bone)
+    else:
+        hips_horiz, hips_vert = [0, 1], 2
+
+    root_bone = base_arm.data.bones.get("Root")
+    if root_bone:
+        root_horiz, root_vert = classify_bone_location_axes(root_bone)
+        root_lock_axes = tuple(root_horiz) + ((root_vert,) if ground_lock else ())
+    else:
+        root_lock_axes = (0, 1, 2) if ground_lock else (0, 1)
 
     changed = False
     touched = False
@@ -805,15 +820,15 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
     # Root carries the intended global trajectory when present.
     root_target = 'pose.bones["Root"].location'
     root_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == root_target]
-    axes = (0, 1, 2) if ground_lock else (0, 1)
-    t_root, c_root = lock_axes(root_curves, axes, value=0.0)
+    t_root, c_root = lock_axes(root_curves, root_lock_axes, value=0.0)
     touched = touched or t_root
     changed = changed or c_root
 
+    # Object curves are in world space — axes 0,1 = horizontal, 2 = vertical.
     obj_target = "location"
     obj_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == obj_target]
-    # Some imports place trajectory in armature object instead of Root.
-    t_obj, c_obj = lock_axes(obj_curves, axes, value=0.0)
+    obj_lock_axes = (0, 1, 2) if ground_lock else (0, 1)
+    t_obj, c_obj = lock_axes(obj_curves, obj_lock_axes, value=0.0)
     touched = touched or t_obj
     changed = changed or c_obj
 
@@ -822,10 +837,13 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
     hips_by_axis = location_curve_map(hips_curves)
     should_fallback = (not touched)
     if not should_fallback and hips_curves:
-        # Even when Root/Object exists, fallback if Hips still has net XY drift.
-        d0 = abs(curve_end_start_delta(hips_by_axis.get(0))) if hips_by_axis.get(0) else 0.0
-        d1 = abs(curve_end_start_delta(hips_by_axis.get(1))) if hips_by_axis.get(1) else 0.0
-        if max(d0, d1) > 1e-6:
+        # Even when Root/Object exists, fallback if Hips still has net horizontal drift.
+        max_drift = 0.0
+        for ax in hips_horiz:
+            fc = hips_by_axis.get(ax)
+            if fc:
+                max_drift = max(max_drift, abs(curve_end_start_delta(fc)))
+        if max_drift > 1e-6:
             should_fallback = True
 
     if should_fallback:
@@ -833,59 +851,30 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
             result["status"] = "no_root_object_or_hips_location_curves"
             return result
 
-        # Optional anchor by foot: use foot trend as reference and subtract it from Hips.
-        # If not available, fallback to Hips self-detrend.
-        anchor_trend_by_axis = {}
-        anchor_signal_by_axis = {}
-        if anchor == "foot":
-            foot_candidates = find_foot_bone_names(base_arm)
-            per_axis = {0: [], 1: []}
-            per_axis_signal = {0: [], 1: []}
-            used_bones = []
-            for bone_name in foot_candidates:
-                foot_target = f'pose.bones["{bone_name}"].location'
-                foot_curves = [fc for fc in iter_action_fcurves(action) if fc.data_path == foot_target]
-                foot_by_axis = location_curve_map(foot_curves)
-                used = False
-                for axis in (0, 1):
-                    fc = foot_by_axis.get(axis)
-                    if fc is None:
-                        continue
-                    tr = trend_line_values(fc)
-                    if tr is not None:
-                        per_axis[axis].append(tr)
-                        per_axis_signal[axis].append(fc)
-                        used = True
-                if used:
-                    used_bones.append(bone_name)
-
-            for axis in (0, 1):
-                anchor_trend_by_axis[axis] = combine_trends(per_axis[axis])
-                anchor_signal_by_axis[axis] = per_axis_signal[axis]
-            if used_bones:
-                result["anchor_bone"] = ",".join(used_bones[:4])
-
-        for axis in (0, 1):
+        # Remove horizontal drift from Hips via linear detrend.
+        for axis in hips_horiz:
             hips_fc = hips_by_axis.get(axis)
             if hips_fc is None:
                 continue
-            if anchor_signal_by_axis.get(axis):
-                if subtract_anchor_signal(hips_fc, anchor_signal_by_axis[axis]):
-                    changed = True
-            elif anchor_trend_by_axis.get(axis) is not None:
-                if apply_trend_subtraction(hips_fc, anchor_trend_by_axis[axis]):
-                    changed = True
-            else:
-                if detrend_curve(hips_fc):
-                    changed = True
-            # Enforce strict in-place without discarding anchor behavior.
+            if detrend_curve(hips_fc):
+                changed = True
             if remove_residual_end_drift(hips_fc):
                 changed = True
 
-        if ground_lock and 2 in hips_by_axis:
-            # Keep smooth vertical motion and only normalize baseline.
-            if shift_curve_to_zero_start(hips_by_axis[2]):
-                changed = True
+        if ground_lock and hips_vert in hips_by_axis:
+            if anchor == "foot":
+                foot_names = find_foot_bone_names(base_arm)
+                ground_z = evaluate_foot_ground_z(base_arm, action, foot_names)
+                if ground_z is not None:
+                    result["anchor_bone"] = ",".join(foot_names[:4])
+                    if shift_curve_by(hips_by_axis[hips_vert], -ground_z):
+                        changed = True
+                else:
+                    if shift_curve_to_zero_start(hips_by_axis[hips_vert]):
+                        changed = True
+            else:
+                if shift_curve_to_zero_start(hips_by_axis[hips_vert]):
+                    changed = True
 
         result["status"] = "applied_fallback" if changed else "already_inplace_fallback"
     else:
