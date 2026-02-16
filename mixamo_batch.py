@@ -732,10 +732,12 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
         for kp in pts:
             t = float(kp.co[0])
             trend = v0 + m * (t - t0)
-            if abs(trend) > 1e-8:
+            hl_trend = v0 + m * (float(kp.handle_left[0]) - t0)
+            hr_trend = v0 + m * (float(kp.handle_right[0]) - t0)
+            if abs(trend) > 1e-8 or abs(hl_trend) > 1e-8 or abs(hr_trend) > 1e-8:
                 kp.co[1] -= trend
-                kp.handle_left[1] -= trend
-                kp.handle_right[1] -= trend
+                kp.handle_left[1] -= hl_trend
+                kp.handle_right[1] -= hr_trend
                 changed_local = True
         fc.update()
         return changed_local
@@ -787,10 +789,11 @@ def make_inplace_on_action(base_arm, action, ground_lock=True, anchor="hips"):
         changed_local = False
         for kp in pts:
             alpha = (float(kp.co[0]) - t0) / (t1 - t0)
-            corr = delta * alpha
-            kp.co[1] -= corr
-            kp.handle_left[1] -= corr
-            kp.handle_right[1] -= corr
+            alpha_hl = (float(kp.handle_left[0]) - t0) / (t1 - t0)
+            alpha_hr = (float(kp.handle_right[0]) - t0) / (t1 - t0)
+            kp.co[1] -= delta * alpha
+            kp.handle_left[1] -= delta * alpha_hl
+            kp.handle_right[1] -= delta * alpha_hr
             changed_local = True
         fc.update()
         return changed_local
